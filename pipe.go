@@ -3,6 +3,7 @@ package pipe
 import (
 	"fmt"
 	"sync"
+	"context"
 )
 
 const MaxItems = 1000
@@ -60,39 +61,53 @@ type processTask struct {
 const sizeBatchQueue = 100
 
 func Pipe(p Producer, c Consumer) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	var wg sync.WaitGroup
-	var errRes error
 
 	readyBatchCh := make(chan batch, sizeBatchQueue)
 	commitTaskCh := make(chan *commitTask, sizeBatchQueue)
 	errNextCh := make(chan error, 1)
 	errCommitCh := make(chan error, 1)
-	stopHandlerNextCh := make(chan bool, 1)
 
 	defer func() {
-		close(readyBatchCh)
-		close(commitTaskCh)
 		close(errNextCh)
 		close(errCommitCh)
-		close(stopHandlerNextCh)
 	}()
 
 	wg.Add(2)
-	go handlerNext(p, &wg, readyBatchCh, stopHandlerNextCh, errNextCh)
-	go handlerCommit(p, &wg, commitTaskCh, errCommitCh)
+	go handlerNext(ctx, p, &wg, readyBatchCh, errNextCh)
+	go handlerCommit(ctx, p, &wg, commitTaskCh, errCommitCh)
 
-Loop:
+	defer wg.Wait()
+
 	for {
 		select {
 		case err := <-errCommitCh:
-			fmt.Println("pipe errCommitCh")
-			errRes = err
-			stopHandlerNextCh <- true
-			break Loop
+			cancel()
+			return err
 
 		case err := <-errNextCh:
-			errRes = err
-			break Loop
+			if err != nil {
+				cmt := newCommitTask(nil)
+				cmt.err = err
+				cmt.isReady = true
+				commitTaskCh <- cmt
+				return <-errCommitCh
+			}
+			for btch := range readyBatchCh {
+				cmt := newCommitTask(btch.cookies)
+				prt := processTask{
+					CommitTask: cmt,
+					items:         btch.items,
+				}
+				commitTaskCh <- cmt
+				wg.Add(1)
+				go handlerProcess(ctx, c, &wg, prt)
+			}
+			commitTaskCh <- nil
+			return <-errCommitCh
 
 		case btch := <-readyBatchCh:
 			cmt := newCommitTask(btch.cookies)
@@ -102,40 +117,20 @@ Loop:
 			}
 			commitTaskCh <- cmt
 			wg.Add(1)
-			go handlerProcess(c, &wg, prt)
+			go handlerProcess(ctx, c, &wg, prt)
 		}
 	}
-
-	for i:=0; i< len(readyBatchCh); i++ {
-		btch := <-readyBatchCh
-		cmt := newCommitTask(btch.cookies)
-		prt := processTask{
-			CommitTask: cmt,
-			items:         btch.items,
-		}
-		commitTaskCh <- cmt
-		wg.Add(1)
-		go handlerProcess(c, &wg, prt)
-	}
-	commitTaskCh <- nil
-
-	wg.Wait()
-	if err := <-errCommitCh; err!=nil {
-		errRes = err
-	}
-
-	return errRes
 }
 
-func handlerNext(p Producer, wg *sync.WaitGroup, readyBatch chan batch, stopCh chan bool, errCh chan error) {
+func handlerNext(ctx context.Context, p Producer, wg *sync.WaitGroup, readyBatch chan batch, errCh chan error) {
 	defer wg.Done()
+	defer close(readyBatch)
 	var buf []any
 	var cookies []int
 
-Loop:
 	for {
 		select {
-		case <-stopCh:
+		case <-ctx.Done():
 			return
 		default:
 			items, cookie, err := p.Next()
@@ -145,7 +140,11 @@ Loop:
 			}
 
 			if len(items) == 0 {
-				break Loop
+				if len(buf) > 0 {
+					readyBatch <- batch{items: buf, cookies: cookies}
+				}
+				errCh <- nil
+				return
 			}
 
 			if len(buf)+len(items) > MaxItems {
@@ -158,16 +157,15 @@ Loop:
 			cookies = append(cookies, cookie)
 		}
 	}
-
-	if len(buf) > 0 {
-		readyBatch <- batch{items: buf, cookies: cookies}
-	}
-	errCh <- nil
 }
 
-func handlerProcess(c Consumer, wg *sync.WaitGroup, prt processTask) {
+func handlerProcess(ctx context.Context, c Consumer, wg *sync.WaitGroup, prt processTask) {
 	defer wg.Done()
 	defer prt.CommitTask.signal()
+
+	if ctx.Err() != nil {
+		return 
+	}
 
 	if err := c.Process(prt.items); err != nil {
 		prt.CommitTask.mu.Lock()
@@ -183,19 +181,24 @@ func handlerProcess(c Consumer, wg *sync.WaitGroup, prt processTask) {
 }
 
 
-func handlerCommit(p Producer, wg *sync.WaitGroup, cmt chan *commitTask, errCh chan error) {
+func handlerCommit(ctx context.Context, p Producer, wg *sync.WaitGroup, cmt chan *commitTask, errCh chan error) {
 	defer wg.Done()
+	defer close(cmt)
 
 	for {
-		task := <-cmt
-		if task == nil {
-			errCh <- nil
+		select {
+		case <-ctx.Done():
 			return
-		}
-		
-		if err := commit(p, task); err != nil {
-			errCh <- err
-			return
+		case task := <-cmt:
+			if task == nil {
+				errCh <- nil
+				return
+			}
+			
+			if err := commit(p, task); err != nil {
+				errCh <- err
+				return
+			}
 		}
 	}
 }
