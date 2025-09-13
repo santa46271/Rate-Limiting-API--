@@ -23,33 +23,19 @@ type batch struct {
 }
 
 type commitTask struct {
-	mu      sync.Mutex
-	cond    *sync.Cond
-	isReady bool
+	isReady chan bool
 	err     error
 	cookies []int
 }
 
 func (t *commitTask) wait() error{
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	for !t.isReady {
-		t.cond.Wait()
-	}
+	<-t.isReady
 
 	return t.err
 }
 
-func (t * commitTask) signal() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.isReady = true
-	t.cond.Broadcast()
-}
-
 func newCommitTask(cookies []int) *commitTask {
-	t := &commitTask{cookies: cookies}
-	t.cond = sync.NewCond(&t.mu)
+	t := &commitTask{isReady: make(chan bool, 1), cookies: cookies}
 	return t
 }
 
@@ -82,6 +68,27 @@ func Pipe(p Producer, c Consumer) error {
 
 	defer wg.Wait()
 
+	lastTask := func(err error) {
+		if err != nil {
+			cmt := newCommitTask(nil)
+			cmt.err = err
+			close(cmt.isReady)
+			commitTaskCh <- cmt
+		}
+		for btch := range readyBatchCh {
+			cmt := newCommitTask(btch.cookies)
+			prt := processTask{
+				CommitTask: cmt,
+				items:         btch.items,
+			}
+			commitTaskCh <- cmt
+			wg.Add(1)
+			go handlerProcess(ctx, c, &wg, prt)
+		}
+		commitTaskCh <- nil
+	}
+
+
 	for {
 		select {
 		case err := <-errCommitCh:
@@ -89,27 +96,14 @@ func Pipe(p Producer, c Consumer) error {
 			return err
 
 		case err := <-errNextCh:
-			if err != nil {
-				cmt := newCommitTask(nil)
-				cmt.err = err
-				cmt.isReady = true
-				commitTaskCh <- cmt
-				return <-errCommitCh
-			}
-			for btch := range readyBatchCh {
-				cmt := newCommitTask(btch.cookies)
-				prt := processTask{
-					CommitTask: cmt,
-					items:         btch.items,
-				}
-				commitTaskCh <- cmt
-				wg.Add(1)
-				go handlerProcess(ctx, c, &wg, prt)
-			}
-			commitTaskCh <- nil
+			lastTask(err)
 			return <-errCommitCh
 
-		case btch := <-readyBatchCh:
+		case btch, ok := <-readyBatchCh:
+			if !ok {
+				lastTask(<-errNextCh)
+				return <-errCommitCh
+			}
 			cmt := newCommitTask(btch.cookies)
 			prt := processTask{
 				CommitTask: cmt,
@@ -161,23 +155,16 @@ func handlerNext(ctx context.Context, p Producer, wg *sync.WaitGroup, readyBatch
 
 func handlerProcess(ctx context.Context, c Consumer, wg *sync.WaitGroup, prt processTask) {
 	defer wg.Done()
-	defer prt.CommitTask.signal()
+	defer close(prt.CommitTask.isReady)
 
 	if ctx.Err() != nil {
 		return 
 	}
 
 	if err := c.Process(prt.items); err != nil {
-		prt.CommitTask.mu.Lock()
-		defer prt.CommitTask.mu.Unlock()
 		prt.CommitTask.err = fmt.Errorf("process error: %w", err)
-		prt.CommitTask.isReady = true
 		return
 	}
-
-	prt.CommitTask.mu.Lock()
-	defer prt.CommitTask.mu.Unlock()
-	prt.CommitTask.isReady = true
 }
 
 
